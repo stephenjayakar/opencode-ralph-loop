@@ -35,15 +35,22 @@ then checks how many items got checked off before starting the next session.
 
 ## The Script
 
-The loop is implemented in `run-until-done.js` (lives in the `home` project at
-`/Users/stephenjayakar/.kimaki/projects/home/run-until-done.js`).
+The loop is implemented in `run-until-done.js` (included in this repo).
+
+Configure the constants at the top of the script before running:
+
+```js
+const PLAN_MD  = '/path/to/your/PLAN.md';
+const CHANNEL  = '<discord-channel-id>';  // from: kimaki project list --json
+const USER     = 'your-discord-username';
+```
 
 ### Usage
 
 ```bash
 # Run in a tmux session so it survives terminal close
 tmux new-session -d -s ralph-loop
-tmux send-keys -t ralph-loop "node /Users/stephenjayakar/.kimaki/projects/home/run-until-done.js 2>&1 | tee /tmp/ralph-loop.log" Enter
+tmux send-keys -t ralph-loop "node run-until-done.js 2>&1 | tee /tmp/ralph-loop.log" Enter
 
 # Watch progress
 tail -f /tmp/ralph-loop.log
@@ -53,11 +60,11 @@ tmux capture-pane -t ralph-loop -p
 node run-until-done.js --dry-run
 
 # Options
-node run-until-done.js --batch 8        # items per session (default: 5)
+node run-until-done.js --batch 8         # items per session (default: 5)
 node run-until-done.js --max-sessions 10 # cap total sessions (default: 50)
 
 # If it crashed and left a stale lock:
-rm /tmp/lt-web-loop.lock
+rm /tmp/ralph-loop.lock
 ```
 
 ---
@@ -90,7 +97,7 @@ Typical prompt size with 5 items: ~700 chars. Well under the limit.
 ### 2. Lock file prevents double-runs
 
 ```js
-const LOCK_FILE = '/tmp/lt-web-loop.lock';
+const LOCK_FILE = '/tmp/ralph-loop.lock';
 
 if (fs.existsSync(LOCK_FILE)) {
   const pid = fs.readFileSync(LOCK_FILE, 'utf8').trim();
