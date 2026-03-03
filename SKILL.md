@@ -125,6 +125,7 @@ Execution rules:
 - Do NOT use the question tool or ask for confirmation.
 - Keep the build passing.
 - Do real implementation work, not stubs.
+- Commit completed work before ending the session (do not push).
 - Do NOT git push.
 ```
 
