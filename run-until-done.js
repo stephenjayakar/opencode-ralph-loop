@@ -15,9 +15,8 @@
  *   --user NAME         Optional kimaki --user value
  *   --dry-run          Print what would be sent without launching sessions
  *   --max-sessions N   Stop after N sessions regardless (default: 50)
- *   --batch N          Number of unchecked items to include per session (default: 5)
  *   --max-hours N      Optional runtime cap in hours (example: 5)
- *   --extra-prompt TXT Additional instruction line (repeatable)
+ *   --additional-prompt TXT Optional generated instruction appended to static prompt
  *   --help             Show usage
  */
 
@@ -31,18 +30,32 @@ const path = require('path');
  * user: string | null;
  * dryRun: boolean;
  * maxSessions: number;
- * batchSize: number;
  * sessionTimeoutMs: number;
  * maxRuntimeMs: number | null;
- * extraPrompts: string[];
+ * additionalPrompt: string | null;
  * logFile: string;
  * lockFile: string;
  * }} Config */
 
 const DEFAULT_MAX_SESSIONS = 50;
-const DEFAULT_BATCH_SIZE = 5;
 const DEFAULT_SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const CHECKBOX_PATTERN = /^- \[ \]/gm;
+const STATIC_BASE_PROMPT = `Kimaki autonomous coding session.
+
+Base rules (always follow):
+1. Use PLAN.md always as the source of truth.
+2. Feel free to add to PLAN.md.
+3. Cross off tasks as you finish them.
+4. Stop when there are no more blank checkboxes.
+5. Read AGENTS.md if it exists.
+6. Pick one task and finish it.
+
+Execution rules:
+- Do NOT use the question tool or ask for confirmation at any point.
+- Keep the build passing.
+- Do real implementation work, not stubs.
+- Commit completed work before ending the session (do not push).
+- Do NOT git push.`;
 
 /** @param {string} message */
 function fail(message) {
@@ -61,9 +74,8 @@ Options:
   --user NAME          Optional kimaki --user value
   --dry-run            Print prompt without launching sessions
   --max-sessions N     Session cap (default: ${DEFAULT_MAX_SESSIONS})
-  --batch N            Unchecked item titles per prompt (default: ${DEFAULT_BATCH_SIZE})
   --max-hours N        Optional runtime cap in hours (example: 5)
-  --extra-prompt TXT   Extra instruction line (repeatable)
+  --additional-prompt TXT  Optional generated instruction appended to static prompt
   --help               Show this message`);
   process.exit(code);
 }
@@ -73,7 +85,7 @@ Options:
  * @returns {Config}
  */
 function parseArgs(argv) {
-  const valueOptions = new Set(['--channel', '--plan', '--user', '--max-sessions', '--batch', '--max-hours', '--extra-prompt']);
+  const valueOptions = new Set(['--channel', '--plan', '--user', '--max-sessions', '--max-hours', '--additional-prompt']);
   const flagOptions = new Set(['--dry-run', '--help']);
 
   /** @type {Map<string, string[]>} */
@@ -144,10 +156,9 @@ function parseArgs(argv) {
   }
 
   const maxSessions = parsePositiveInt(getLast('--max-sessions'), '--max-sessions', DEFAULT_MAX_SESSIONS);
-  const batchSize = parsePositiveInt(getLast('--batch'), '--batch', DEFAULT_BATCH_SIZE);
   const maxHours = parsePositiveNumber(getLast('--max-hours'), '--max-hours', null);
   const maxRuntimeMs = maxHours == null ? null : Math.floor(maxHours * 60 * 60 * 1000);
-  const extraPrompts = values.get('--extra-prompt') ?? [];
+  const additionalPrompt = getLast('--additional-prompt');
 
   const lockSafeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, '_');
   return {
@@ -156,10 +167,9 @@ function parseArgs(argv) {
     user: getLast('--user'),
     dryRun: flags.has('--dry-run'),
     maxSessions,
-    batchSize,
     sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
     maxRuntimeMs,
-    extraPrompts,
+    additionalPrompt,
     logFile: '/tmp/ralph-loop.log',
     lockFile: `/tmp/ralph-loop-${lockSafeChannel}.lock`,
   };
@@ -217,43 +227,12 @@ function getUncheckedItems(planPath) {
   return items;
 }
 
-/** @param {string[]} uncheckedItems */
-function buildPrompt(uncheckedItems) {
-  // Keep titles short (strip markdown bold) so the prompt stays under
-  // Discord's 2000-char limit and is never sent as a file attachment
-  // (which confuses the agent and causes sessions to complete instantly).
-  const titles = uncheckedItems
-    .slice(0, config.batchSize)
-    .map((item, idx) => {
-      const title = item.replace(/\*\*/g, '').split('.')[0].trim().slice(0, 80);
-      return `${idx + 1}. ${title}`;
-    })
-    .join('\n');
+function buildPrompt() {
+  if (!config.additionalPrompt) {
+    return STATIC_BASE_PROMPT;
+  }
 
-  const extraPromptBlock = config.extraPrompts.length === 0
-    ? ''
-    : `\nAdditional instructions:\n${config.extraPrompts.map((line) => `- ${line}`).join('\n')}`;
-
-  return `Kimaki autonomous coding session.
-
-Candidate unchecked tasks (read PLAN.md for full details):
-
-${titles}
-
-Base rules (always follow):
-1. Use PLAN.md always as the source of truth.
-2. Feel free to add to PLAN.md.
-3. Cross off tasks as you finish them.
-4. Stop when there are no more blank checkboxes.
-5. Read AGENTS.md if it exists.
-6. Pick one task and finish it.
-
-Execution rules:
-- Do NOT use the question tool or ask for confirmation at any point.
-- Keep the build passing.
-- Do real implementation work, not stubs.
-- Commit completed work before ending the session (do not push).
-- Do NOT git push.${extraPromptBlock}`;
+  return `${STATIC_BASE_PROMPT}\n\nAdditional instruction:\n- ${config.additionalPrompt}`;
 }
 
 /** @param {string} planPath */
@@ -279,7 +258,7 @@ async function main() {
     : String((config.maxRuntimeMs / (60 * 60 * 1000)).toFixed(2));
 
   log(`Starting ralph loop. PLAN.md: ${config.planPath}`);
-  log(`Channel: ${config.channel}, Max sessions: ${config.maxSessions}, Batch size: ${config.batchSize}, Dry run: ${config.dryRun}, Max hours: ${maxHoursText}, PID: ${process.pid}`);
+  log(`Channel: ${config.channel}, Max sessions: ${config.maxSessions}, Dry run: ${config.dryRun}, Max hours: ${maxHoursText}, PID: ${process.pid}`);
 
   let sessionCount    = 0;
   let noProgressCount = 0;
@@ -301,9 +280,9 @@ async function main() {
     }
 
     sessionCount++;
-    log(`Starting session ${sessionCount}/${config.maxSessions} (working on up to ${config.batchSize} item titles)...`);
+    log(`Starting session ${sessionCount}/${config.maxSessions}...`);
 
-    const prompt = buildPrompt(unchecked);
+    const prompt = buildPrompt();
 
     if (config.dryRun) {
       log('[DRY RUN] Would send this prompt:');

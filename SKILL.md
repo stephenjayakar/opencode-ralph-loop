@@ -53,10 +53,9 @@ tmux capture-pane -t ralph-loop -p
 node run-until-done.js --channel <discord-channel-id> --dry-run
 
 # Options
-node run-until-done.js --channel <discord-channel-id> --batch 8
 node run-until-done.js --channel <discord-channel-id> --max-sessions 10
 node run-until-done.js --channel <discord-channel-id> --max-hours 5
-node run-until-done.js --channel <discord-channel-id> --extra-prompt "Run tests before closing task"
+node run-until-done.js --channel <discord-channel-id> --additional-prompt "Run tests before closing task"
 
 # If it crashed and left a stale lock:
 rm /tmp/ralph-loop-<discord-channel-id>.lock
@@ -66,7 +65,7 @@ rm /tmp/ralph-loop-<discord-channel-id>.lock
 
 ## Key Design Decisions
 
-### 1. Prompt must stay under 2000 chars
+### 1. Prompt is static (plus optional generated add-on)
 
 Discord has a 2000-char message limit. If the prompt exceeds it, kimaki
 automatically sends it as a file attachment (`prompt.md`). The agent then
@@ -77,17 +76,9 @@ receives:
 ...and may not parse the attachment correctly, causing sessions to complete
 instantly without doing any work.
 
-**Fix:** Keep the prompt short. Pass only item *titles* (not full descriptions),
-and tell the agent to read `PLAN.md` itself for details.
-
-```js
-const titles = uncheckedItems.slice(0, BATCH_SIZE).map((item, idx) => {
-  const title = item.replace(/\*\*/g, '').split('.')[0].trim().slice(0, 80);
-  return `${idx + 1}. ${title}`;
-}).join('\n');
-```
-
-Typical prompt size with 5 items: ~700 chars. Well under the limit.
+**Fix:** Use a static base prompt each session so behavior is consistent,
+and optionally append one generated line passed in via `--additional-prompt`.
+This keeps prompt size predictable while still allowing per-run context.
 
 ### 2. Lock file prevents double-runs
 
