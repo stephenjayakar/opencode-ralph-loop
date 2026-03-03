@@ -36,35 +36,30 @@ then checks how many items got checked off before starting the next session.
 ## The Script
 
 The loop is implemented in `run-until-done.js` (included in this repo).
-
-Configure the constants at the top of the script before running:
-
-```js
-const PLAN_MD  = '/path/to/your/PLAN.md';
-const CHANNEL  = '<discord-channel-id>';  // from: kimaki project list --json
-const USER     = 'your-discord-username';
-```
+It is now CLI-driven and requires a channel input (thread/session IDs are not accepted).
 
 ### Usage
 
 ```bash
 # Run in a tmux session so it survives terminal close
 tmux new-session -d -s ralph-loop
-tmux send-keys -t ralph-loop "node run-until-done.js 2>&1 | tee /tmp/ralph-loop.log" Enter
+tmux send-keys -t ralph-loop "node run-until-done.js --channel <discord-channel-id> --plan /path/to/PLAN.md 2>&1 | tee /tmp/ralph-loop.log" Enter
 
 # Watch progress
 tail -f /tmp/ralph-loop.log
 tmux capture-pane -t ralph-loop -p
 
 # Dry run (see what prompt would be sent without firing sessions)
-node run-until-done.js --dry-run
+node run-until-done.js --channel <discord-channel-id> --dry-run
 
 # Options
-node run-until-done.js --batch 8         # items per session (default: 5)
-node run-until-done.js --max-sessions 10 # cap total sessions (default: 50)
+node run-until-done.js --channel <discord-channel-id> --batch 8
+node run-until-done.js --channel <discord-channel-id> --max-sessions 10
+node run-until-done.js --channel <discord-channel-id> --max-hours 5
+node run-until-done.js --channel <discord-channel-id> --extra-prompt "Run tests before closing task"
 
 # If it crashed and left a stale lock:
-rm /tmp/ralph-loop.lock
+rm /tmp/ralph-loop-<discord-channel-id>.lock
 ```
 
 ---
@@ -118,13 +113,18 @@ There is no `--no-questions` flag in `kimaki send`. Autonomous behavior is
 enforced entirely through the prompt:
 
 ```
-Rules:
-- Do NOT use the question tool or ask for confirmation at any point.
-- Make decisions yourself.
-- Read the Python source in lt-maker/ before implementing each feature.
-- Keep the build passing (npm run build).
-- Check off each item in PLAN.md when done (- [ ] -> - [x]).
-- Do the real implementation, not stubs.
+Base rules (always follow):
+1. Use PLAN.md always as the source of truth.
+2. Feel free to add to PLAN.md.
+3. Cross off tasks as you finish them.
+4. Stop when there are no more blank checkboxes.
+5. Read AGENTS.md if it exists.
+6. Pick one task and finish it.
+
+Execution rules:
+- Do NOT use the question tool or ask for confirmation.
+- Keep the build passing.
+- Do real implementation work, not stubs.
 - Do NOT git push.
 ```
 
@@ -143,18 +143,19 @@ if (completed === 0) {
 }
 ```
 
-### 5. Each session gets a fresh thread
+### 5. Channel-only, fresh thread every run
 
-Do NOT pass `--thread` or `--session` to reuse an existing thread. Each
-`kimaki send` without `--thread` creates a new Discord thread. This prevents
+Do NOT pass `--thread` or `--session` to reuse an existing thread. The script
+rejects both flags and requires `--channel`. Each `kimaki send` invocation
+without `--thread` creates a new Discord thread. This prevents
 sessions from piling context into a single thread and confusing the agent with
 prior conversation history.
 
-### 6. Timeout: 30 minutes per session
+### 6. Time limits: per session + optional total runtime
 
-`spawnSync` timeout is set to 30 minutes (`1800000ms`). Sessions doing real
-implementation work (reading source, writing TypeScript, running `tsc`) can
-easily take 15-20 minutes.
+`spawnSync` timeout is set to 30 minutes (`1800000ms`) per session.
+You can also stop the full loop after a wall-clock runtime using `--max-hours`
+(for example, `--max-hours 5`).
 
 ---
 
@@ -163,11 +164,9 @@ easily take 15-20 minutes.
 To use the ralph loop on a different project:
 
 1. Copy `run-until-done.js` to the home project (or anywhere accessible)
-2. Update these constants at the top:
-   ```js
-   const PLAN_MD  = '/path/to/your/PLAN.md';
-   const CHANNEL  = '<discord-channel-id>';  // from: kimaki project list --json
-   const USER     = 'your-discord-username';
+2. Run with required channel and optional plan path/user:
+   ```bash
+   node run-until-done.js --channel <discord-channel-id> --plan /path/to/PLAN.md --user your-discord-username
    ```
 3. Make sure `PLAN.md` uses `- [ ]` / `- [x]` checkbox syntax
 4. Run in tmux as shown above

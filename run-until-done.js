@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @ts-check
 /**
  * run-until-done.js
  *
@@ -6,51 +7,184 @@
  * is checked off (- [ ] -> - [x]).
  *
  * Usage:
- *   node run-until-done.js [--dry-run] [--max-sessions N] [--batch N]
+ *   node run-until-done.js --channel <discord-channel-id> [options]
  *
  * Options:
+ *   --channel ID        Required. Kimaki channel ID (not thread/session)
+ *   --plan PATH         PLAN.md path (default: ./PLAN.md)
+ *   --user NAME         Optional kimaki --user value
  *   --dry-run          Print what would be sent without launching sessions
  *   --max-sessions N   Stop after N sessions regardless (default: 50)
  *   --batch N          Number of unchecked items to include per session (default: 5)
+ *   --max-hours N      Optional runtime cap in hours (example: 5)
+ *   --extra-prompt TXT Additional instruction line (repeatable)
+ *   --help             Show usage
  */
 
 const { spawnSync } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 
-// ── Config — edit these for your project ─────────────────────────────────────
+/** @typedef {{
+ * channel: string;
+ * planPath: string;
+ * user: string | null;
+ * dryRun: boolean;
+ * maxSessions: number;
+ * batchSize: number;
+ * sessionTimeoutMs: number;
+ * maxRuntimeMs: number | null;
+ * extraPrompts: string[];
+ * logFile: string;
+ * lockFile: string;
+ * }} Config */
 
-const PLAN_MD   = '/path/to/your/PLAN.md';
-const CHANNEL   = '<discord-channel-id>';   // from: kimaki project list --json
-const USER      = 'your-discord-username';
-const LOCK_FILE = '/tmp/ralph-loop.lock';
+const DEFAULT_MAX_SESSIONS = 50;
+const DEFAULT_BATCH_SIZE = 5;
+const DEFAULT_SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const CHECKBOX_PATTERN = /^- \[ \]/gm;
 
-// ── Options ───────────────────────────────────────────────────────────────────
+/** @param {string} message */
+function fail(message) {
+  console.error(`ERROR: ${message}`);
+  printUsage(1);
+}
 
-const args         = process.argv.slice(2);
-const DRY_RUN      = args.includes('--dry-run');
-const MAX_SESSIONS = parseInt(args[args.indexOf('--max-sessions') + 1] ?? '50', 10) || 50;
-const BATCH_SIZE   = parseInt(args[args.indexOf('--batch') + 1] ?? '5', 10) || 5;
-// 30 minutes per session — enough time for real implementation work
-const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+/** @param {number} code */
+function printUsage(code) {
+  console.log(`Usage:
+  node run-until-done.js --channel <discord-channel-id> [options]
+
+Options:
+  --channel ID         Required. Kimaki channel ID
+  --plan PATH          PLAN.md path (default: ./PLAN.md)
+  --user NAME          Optional kimaki --user value
+  --dry-run            Print prompt without launching sessions
+  --max-sessions N     Session cap (default: ${DEFAULT_MAX_SESSIONS})
+  --batch N            Unchecked item titles per prompt (default: ${DEFAULT_BATCH_SIZE})
+  --max-hours N        Optional runtime cap in hours (example: 5)
+  --extra-prompt TXT   Extra instruction line (repeatable)
+  --help               Show this message`);
+  process.exit(code);
+}
+
+/**
+ * @param {string[]} argv
+ * @returns {Config}
+ */
+function parseArgs(argv) {
+  const valueOptions = new Set(['--channel', '--plan', '--user', '--max-sessions', '--batch', '--max-hours', '--extra-prompt']);
+  const flagOptions = new Set(['--dry-run', '--help']);
+
+  /** @type {Map<string, string[]>} */
+  const values = new Map();
+  /** @type {Set<string>} */
+  const flags = new Set();
+
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (!token.startsWith('--')) {
+      fail(`Unexpected positional argument: ${token}`);
+    }
+
+    if (token === '--help') printUsage(0);
+    if (token === '--dry-run') {
+      flags.add(token);
+      continue;
+    }
+
+    if (token === '--thread' || token === '--session') {
+      fail('Do not pass --thread or --session. This loop is channel-only and creates fresh threads per run.');
+    }
+
+    if (!valueOptions.has(token) && !flagOptions.has(token)) {
+      fail(`Unknown option: ${token}`);
+    }
+
+    const next = argv[i + 1];
+    if (!next || next.startsWith('--')) {
+      fail(`Missing value for ${token}`);
+    }
+    i++;
+
+    const arr = values.get(token) ?? [];
+    arr.push(next);
+    values.set(token, arr);
+  }
+
+  const getLast = (key, fallback = null) => {
+    const arr = values.get(key);
+    return arr && arr.length > 0 ? arr[arr.length - 1] : fallback;
+  };
+
+  const parsePositiveInt = (raw, key, fallback) => {
+    if (raw == null) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+      fail(`${key} must be a positive integer, received: ${raw}`);
+    }
+    return n;
+  };
+
+  const parsePositiveNumber = (raw, key, fallback) => {
+    if (raw == null) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      fail(`${key} must be a positive number, received: ${raw}`);
+    }
+    return n;
+  };
+
+  const channel = getLast('--channel');
+  if (!channel) fail('--channel is required');
+
+  const planPath = path.resolve(getLast('--plan', path.join(process.cwd(), 'PLAN.md')));
+  if (!fs.existsSync(planPath)) {
+    fail(`PLAN.md not found at ${planPath}`);
+  }
+
+  const maxSessions = parsePositiveInt(getLast('--max-sessions'), '--max-sessions', DEFAULT_MAX_SESSIONS);
+  const batchSize = parsePositiveInt(getLast('--batch'), '--batch', DEFAULT_BATCH_SIZE);
+  const maxHours = parsePositiveNumber(getLast('--max-hours'), '--max-hours', null);
+  const maxRuntimeMs = maxHours == null ? null : Math.floor(maxHours * 60 * 60 * 1000);
+  const extraPrompts = values.get('--extra-prompt') ?? [];
+
+  const lockSafeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return {
+    channel,
+    planPath,
+    user: getLast('--user'),
+    dryRun: flags.has('--dry-run'),
+    maxSessions,
+    batchSize,
+    sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
+    maxRuntimeMs,
+    extraPrompts,
+    logFile: '/tmp/ralph-loop.log',
+    lockFile: `/tmp/ralph-loop-${lockSafeChannel}.lock`,
+  };
+}
+
+const config = parseArgs(process.argv.slice(2));
 
 // ── Lock file (prevent two instances running simultaneously) ──────────────────
 
-if (fs.existsSync(LOCK_FILE)) {
-  const pid = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+if (fs.existsSync(config.lockFile)) {
+  const pid = fs.readFileSync(config.lockFile, 'utf8').trim();
   try {
     process.kill(parseInt(pid, 10), 0); // throws if pid not alive
-    console.error(`ERROR: Another instance is already running (pid ${pid}). Delete ${LOCK_FILE} to force.`);
+    console.error(`ERROR: Another instance is already running (pid ${pid}). Delete ${config.lockFile} to force.`);
     process.exit(1);
   } catch {
     // Process is gone — stale lock, remove it
-    fs.unlinkSync(LOCK_FILE);
+    fs.unlinkSync(config.lockFile);
   }
 }
 
-fs.writeFileSync(LOCK_FILE, String(process.pid), 'utf8');
+fs.writeFileSync(config.lockFile, String(process.pid), 'utf8');
 
 function removeLock() {
-  try { fs.unlinkSync(LOCK_FILE); } catch {}
+  try { fs.unlinkSync(config.lockFile); } catch {}
 }
 process.on('exit', removeLock);
 process.on('SIGINT', () => { removeLock(); process.exit(130); });
@@ -58,9 +192,11 @@ process.on('SIGTERM', () => { removeLock(); process.exit(143); });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/** @param {string} planPath */
 function getUncheckedItems(planPath) {
   const content = fs.readFileSync(planPath, 'utf8');
   const lines   = content.split('\n');
+  /** @type {string[]} */
   const items   = [];
   let   i       = 0;
 
@@ -81,55 +217,79 @@ function getUncheckedItems(planPath) {
   return items;
 }
 
+/** @param {string[]} uncheckedItems */
 function buildPrompt(uncheckedItems) {
   // Keep titles short (strip markdown bold) so the prompt stays under
   // Discord's 2000-char limit and is never sent as a file attachment
   // (which confuses the agent and causes sessions to complete instantly).
   const titles = uncheckedItems
-    .slice(0, BATCH_SIZE)
+    .slice(0, config.batchSize)
     .map((item, idx) => {
       const title = item.replace(/\*\*/g, '').split('.')[0].trim().slice(0, 80);
       return `${idx + 1}. ${title}`;
     })
     .join('\n');
 
-  return `Autonomous coding session.
+  const extraPromptBlock = config.extraPrompts.length === 0
+    ? ''
+    : `\nAdditional instructions:\n${config.extraPrompts.map((line) => `- ${line}`).join('\n')}`;
 
-Read PLAN.md for full details on each item. Implement as many of these unchecked items as you can:
+  return `Kimaki autonomous coding session.
+
+Candidate unchecked tasks (read PLAN.md for full details):
 
 ${titles}
 
-Rules:
-- Do NOT use the question tool or ask for confirmation at any point. Make decisions yourself.
+Base rules (always follow):
+1. Use PLAN.md always as the source of truth.
+2. Feel free to add to PLAN.md.
+3. Cross off tasks as you finish them.
+4. Stop when there are no more blank checkboxes.
+5. Read AGENTS.md if it exists.
+6. Pick one task and finish it.
+
+Execution rules:
+- Do NOT use the question tool or ask for confirmation at any point.
 - Keep the build passing.
-- Check off each item in PLAN.md when done (- [ ] -> - [x]) and update any changelog/Recent Changes section.
-- Do the real implementation, not stubs. If an item is too large, implement as much as possible.
-- Do NOT git push.`;
+- Do real implementation work, not stubs.
+- Do NOT git push.${extraPromptBlock}`;
 }
 
+/** @param {string} planPath */
 function countUnchecked(planPath) {
   const content = fs.readFileSync(planPath, 'utf8');
-  return (content.match(/^- \[ \]/gm) || []).length;
+  return (content.match(CHECKBOX_PATTERN) || []).length;
 }
 
+/** @param {string} msg */
 function log(msg) {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const line = `[${ts}] ${msg}`;
   console.log(line);
-  fs.appendFileSync('/tmp/ralph-loop.log', line + '\n');
+  fs.appendFileSync(config.logFile, line + '\n');
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 async function main() {
-  log(`Starting ralph loop. PLAN.md: ${PLAN_MD}`);
-  log(`Max sessions: ${MAX_SESSIONS}, Batch size: ${BATCH_SIZE}, Dry run: ${DRY_RUN}, PID: ${process.pid}`);
+  const startMs = Date.now();
+  const maxHoursText = config.maxRuntimeMs == null
+    ? 'none'
+    : String((config.maxRuntimeMs / (60 * 60 * 1000)).toFixed(2));
+
+  log(`Starting ralph loop. PLAN.md: ${config.planPath}`);
+  log(`Channel: ${config.channel}, Max sessions: ${config.maxSessions}, Batch size: ${config.batchSize}, Dry run: ${config.dryRun}, Max hours: ${maxHoursText}, PID: ${process.pid}`);
 
   let sessionCount    = 0;
   let noProgressCount = 0;
 
-  while (sessionCount < MAX_SESSIONS) {
-    const unchecked = getUncheckedItems(PLAN_MD);
+  while (sessionCount < config.maxSessions) {
+    if (config.maxRuntimeMs != null && Date.now() - startMs >= config.maxRuntimeMs) {
+      log('Stopping: reached max runtime limit.');
+      break;
+    }
+
+    const unchecked = getUncheckedItems(config.planPath);
     const count     = unchecked.length;
 
     log(`Unchecked items remaining: ${count}`);
@@ -140,11 +300,11 @@ async function main() {
     }
 
     sessionCount++;
-    log(`Starting session ${sessionCount}/${MAX_SESSIONS} (working on up to ${BATCH_SIZE} items)...`);
+    log(`Starting session ${sessionCount}/${config.maxSessions} (working on up to ${config.batchSize} item titles)...`);
 
     const prompt = buildPrompt(unchecked);
 
-    if (DRY_RUN) {
+    if (config.dryRun) {
       log('[DRY RUN] Would send this prompt:');
       console.log('─'.repeat(60));
       console.log(prompt);
@@ -156,21 +316,19 @@ async function main() {
     const beforeCount = count;
 
     try {
-      log(`Launching kimaki session (timeout: ${SESSION_TIMEOUT_MS / 1000}s)...`);
+      log(`Launching kimaki send (timeout: ${config.sessionTimeoutMs / 1000}s)...`);
 
       // Each session gets a fresh thread — do NOT pass --thread/--session,
       // which would pile context into one thread and confuse the agent.
-      const result = spawnSync(
-        'npx',
-        [
-          '-y', 'kimaki', 'send',
-          '--channel', CHANNEL,
-          '--prompt',  prompt,
-          '--user',    USER,
-          '--wait',
-        ],
+      /** @type {string[]} */
+      const kimakiArgs = ['-y', 'kimaki', 'send', '--channel', config.channel, '--prompt', prompt, '--wait'];
+      if (config.user) {
+        kimakiArgs.push('--user', config.user);
+      }
+
+      const result = spawnSync('npx', kimakiArgs,
         {
-          timeout:   SESSION_TIMEOUT_MS,
+          timeout:   config.sessionTimeoutMs,
           encoding:  'utf8',
           stdio:     ['ignore', 'pipe', 'pipe'],
           maxBuffer: 20 * 1024 * 1024, // 20 MB
@@ -186,10 +344,11 @@ async function main() {
         log('Session completed successfully.');
       }
     } catch (err) {
-      log(`Session exception: ${err.message}`);
+      const error = /** @type {Error} */ (err);
+      log(`Session exception: ${error.message}`);
     }
 
-    const afterCount = countUnchecked(PLAN_MD);
+    const afterCount = countUnchecked(config.planPath);
     const completed  = beforeCount - afterCount;
 
     log(`Items completed this session: ${completed} (${beforeCount} -> ${afterCount} remaining)`);
@@ -199,7 +358,7 @@ async function main() {
       log(`No progress (${noProgressCount} consecutive zero-progress sessions).`);
 
       if (noProgressCount >= 3) {
-        log('Stopping: 3 consecutive sessions with no progress. Check the Discord thread for errors.');
+        log('Stopping: 3 consecutive sessions with no progress. Check kimaki output for errors.');
         break;
       }
 
@@ -210,7 +369,7 @@ async function main() {
     }
   }
 
-  const finalCount = countUnchecked(PLAN_MD);
+  const finalCount = countUnchecked(config.planPath);
   log(`─── Run complete ───`);
   log(`Total sessions run: ${sessionCount}`);
   log(`Unchecked items remaining: ${finalCount}`);
